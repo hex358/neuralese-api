@@ -5,22 +5,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from graph_core import node, Context
+from graph_core import node, Context, execute_graph
+#rint(torch.cuda)
 
 
 def _device_from_ctx(ctx: Context) -> torch.device:
-	# Reads the preferred device from the context; falls back to CPU.
-	# Keeps all tensors and modules on the same device so math works and is fast.
-	try:
-		dev = ctx.extra.get("device", "cpu")
-	except Exception:
-		dev = "cpu"
-	return torch.device(dev)
+	"""
+	Reads the preferred device string from ctx.extra["device"] (e.g., "cpu", "cuda")
+	and returns a torch.device. Keeps tensors/modules on the same device so math is valid.
+	"""
+	return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def _stable_cache_key(prefix: str, props: Dict[str, Any]) -> str:
-	# Creates a stable string key from any dict of layer settings.
-	# This key is used to fetch/reuse the same PyTorch layer between calls.
+	"""
+	Builds a stable string key from layer settings. The key is used to cache and reuse
+	the same PyTorch module across forward/training steps so its parameters persist.
+	"""
 	try:
 		body = json.dumps(props, sort_keys=True, default=str)
 	except Exception:
@@ -29,16 +30,19 @@ def _stable_cache_key(prefix: str, props: Dict[str, Any]) -> str:
 
 
 def _param_count(module: Optional[nn.Module]) -> int:
-	# Counts how many trainable numbers (parameters) a layer has.
-	# Helpful for showing kids that dense layers have more parameters than pooling.
+	"""
+	Returns the number of trainable parameters for display/debugging. None -> 0.
+	"""
 	if module is None:
 		return 0
 	return sum(p.numel() for p in module.parameters())
 
 
 def _make_pack(t: torch.Tensor, kind: str, module: Optional[nn.Module]) -> Dict[str, Any]:
-	# Wraps a tensor into a tiny, consistent “datapack”.
-	# Each node passes datapacks so graphs stay uniform and easy to debug.
+	"""
+	Wraps a tensor and a few facts into a tiny 'datapack' dict. Every node returns
+	a datapack so graphs can branch/merge uniformly and UIs can inspect shapes easily.
+	"""
 	return {
 		"tensor": t,
 		"shape": tuple(t.shape),
@@ -50,17 +54,21 @@ def _make_pack(t: torch.Tensor, kind: str, module: Optional[nn.Module]) -> Dict[
 
 
 def _to_tensor(value: Any, device: torch.device) -> torch.Tensor:
-	# Turns Python numbers/lists into tensors on the right device.
-	# If it’s already a tensor, it is moved to the right device.
+	"""
+	Converts Python numbers/lists or existing tensors to a torch.Tensor placed
+	on the desired device. Preserves dtype=float32 by default for simplicity.
+	"""
 	if isinstance(value, torch.Tensor):
 		return value.to(device)
 	return torch.tensor(value, dtype=torch.float32, device=device)
 
 
 def _merge_inputs(vals: List[Any], device: torch.device) -> torch.Tensor:
-	# Accepts a list of datapacks or raw values from a port and combines them.
-	# All inputs must share the exact same shape; they are added element-wise.
-	# Returning a single input as-is is a fast path when the list length is 1.
+	"""
+	Accepts a list of datapacks or raw values. Unpacks each to a tensor on the given
+	device and elementwise-sums them. All inputs must share the exact same shape.
+	Returns the single tensor unchanged when the list has length 1.
+	"""
 	if not isinstance(vals, list):
 		raise TypeError(f"_merge_inputs expected list, got {type(vals).__name__}")
 	if len(vals) == 0:
@@ -83,24 +91,30 @@ def _merge_inputs(vals: List[Any], device: torch.device) -> torch.Tensor:
 
 _ACT = {
 	"relu": torch.relu,
+	"gelu": F.gelu,
 	"sigmoid": torch.sigmoid,
 	"tanh": torch.tanh,
 	"none": lambda x: x,
 }
 
 
-def _apply_activation(x: torch.Tensor, props: Dict[str, Any]) -> torch.Tensor:
-	# Applies the requested activation by name (“relu”, “sigmoid”, etc.).
-	# If none is requested, the tensor passes through unchanged.
-	cfg = props.get("config", {})
-	act = str(cfg.get("activation", "none")).lower()
+def _apply_activation(x: torch.Tensor, props: Dict[str, Any], default_name: str = "none") -> torch.Tensor:
+	"""
+	Looks up props.config.activation (a lowercased string like "relu", "gelu", etc.)
+	and applies it to the tensor. If not set, uses the provided default_name.
+	Unknown names fall back to identity (no change).
+	"""
+	cfg = props.get("config", {}) or {}
+	act = str(cfg.get("activation", default_name)).lower()
 	fn = _ACT.get(act, _ACT["none"])
 	return fn(x)
 
 
 def _get_modules(ctx: Context) -> Dict[str, nn.Module]:
-	# Returns a global cache of built layers, keyed by their settings.
-	# Reusing modules means parameters persist between graph runs (important for training).
+	"""
+	Returns a dict-like cache (in ctx.extra) where each key is a layer signature and
+	each value is a PyTorch module. This makes parameters persist across runs/training.
+	"""
 	try:
 		return ctx.extra.setdefault("_module_cache", {})
 	except Exception:
@@ -110,8 +124,10 @@ def _get_modules(ctx: Context) -> Dict[str, nn.Module]:
 
 
 def _get_or_make_module(ctx: Context, key: str, maker: Callable[[], nn.Module]) -> nn.Module:
-	# Fetches a module from cache or builds a new one if missing.
-	# Ensures the same Linear/Conv2d instance is reused across forward passes.
+	"""
+	Fetches a module from the cache by key, or creates and stores a new one by calling
+	the provided 'maker'. Ensures the same module instance is reused later.
+	"""
 	cache = _get_modules(ctx)
 	if key not in cache:
 		cache[key] = maker()
@@ -119,7 +135,10 @@ def _get_or_make_module(ctx: Context, key: str, maker: Callable[[], nn.Module]) 
 
 
 def _get_optim_cache(ctx: Context) -> Dict[str, torch.optim.Optimizer]:
-	# Separate cache for optimizers so training steps can reuse them too.
+	"""
+	Returns a dedicated optimizer cache from ctx.extra. We separate it from the module
+	cache so different optimizer hyperparameters can coexist without conflicts.
+	"""
 	try:
 		return ctx.extra.setdefault("_optim_cache", {})
 	except Exception:
@@ -129,8 +148,10 @@ def _get_optim_cache(ctx: Context) -> Dict[str, torch.optim.Optimizer]:
 
 
 def _gather_params(ctx: Context) -> List[nn.Parameter]:
-	# Collects all trainable parameters from every cached module.
-	# This lets the Training node update the whole network at once.
+	"""
+	Collects all trainable parameters from every cached module. The TrainingNode uses
+	this to update the whole network at once, regardless of branches/merges.
+	"""
 	params: List[nn.Parameter] = []
 	for m in _get_modules(ctx).values():
 		for p in m.parameters(recurse=True):
@@ -140,15 +161,24 @@ def _gather_params(ctx: Context) -> List[nn.Parameter]:
 
 
 def _set_all_modules_training(ctx: Context, training: bool) -> None:
-	# Switches every cached module into train/eval mode.
-	# Dropout and BatchNorm behave differently in training mode.
+	"""
+	Sets every cached module to training or evaluation mode. This matters for Dropout
+	and normalization layers; here we flip them to training during a train step.
+	"""
 	for m in _get_modules(ctx).values():
 		m.train(training)
 
 
 def _get_or_make_optimizer(ctx: Context, cfg: Dict[str, Any]) -> Optional[torch.optim.Optimizer]:
-	# Builds or reuses an optimizer over all current parameters using simple settings.
-	# If parameters change (e.g., graph shape changes), the optimizer is rebuilt automatically.
+	"""
+	Creates or reuses an optimizer over all current parameters using simple knobs:
+	- optimizer: "sgd" or "adam"
+	- lr: float (default 1e-2)
+	- weight_decay: float (default 0.0)
+	- momentum: float (only for sgd; default 0.0)
+	- betas: pair (only for adam; default (0.9, 0.999))
+	If the set of parameters changes (e.g., graph shape changed), the optimizer is rebuilt.
+	"""
 	params = _gather_params(ctx)
 	if not params:
 		return None
@@ -165,7 +195,6 @@ def _get_or_make_optimizer(ctx: Context, cfg: Dict[str, Any]) -> Optional[torch.
 	def make():
 		if opt_name == "adam":
 			return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay, betas=betas)
-		# default: SGD (kids can see momentum effect later)
 		return torch.optim.SGD(params, lr=lr, weight_decay=weight_decay, momentum=momentum)
 
 	if opt is None:
@@ -181,17 +210,25 @@ def _get_or_make_optimizer(ctx: Context, cfg: Dict[str, Any]) -> Optional[torch.
 
 @node("InputNode")
 def input_node(inputs: Dict[str, Any], props: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-	# Makes the very first datapack in a graph from a user-provided value.
-	# Kids can feed numbers, lists, or images (lists of lists) here.
+	"""
+	Creates the first datapack from user data. Accepts numbers/lists/tensors and
+	outputs a pack with the tensor, shape, dtype, and a friendly 'layer_kind' tag.
+	Port: input_out
+	"""
 	device = _device_from_ctx(ctx)
-	payload = props.get("value", [0.0, 1.0, 1.0, 1.0])
+	payload = props.get("value", [1.0, 1.0, 1.0, 1.0])
 	t = _to_tensor(payload, device)
 	return {"input_out": _make_pack(t, "input", None)}
 
 
 def _dense(pack_in: List[Any], props: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-	# Fully-connected layer: turns a list of numbers into a new list with chosen size.
-	# Respects activation (“relu”, “sigmoid”, etc.). Caches weights so they can learn.
+	"""
+	Fully-connected layer for vectors. Expects [B, F] (adds batch when given [F]).
+	Knobs:
+	- neuron_count or config.units (int): output size
+	- config.bias (bool): bias on/off (default True)
+	- config.activation (str): "relu", "sigmoid", "tanh", "none" (default "none")
+	"""
 	device = _device_from_ctx(ctx)
 	x = _merge_inputs(pack_in, device)
 	if x.dim() == 1:
@@ -207,56 +244,71 @@ def _dense(pack_in: List[Any], props: Dict[str, Any], ctx: Context) -> Dict[str,
 	layer.train(bool(cfg.get("training", False)))
 
 	y = layer(x)
-	y = _apply_activation(y, props)
+	y = _apply_activation(y, props, default_name="none")
 	return _make_pack(y, "dense", layer)
 
 
 def _conv2d(pack_in: List[Any], props: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-	# 2D convolution: looks at images with a sliding window to make new feature maps.
-	# Expects [N,C,H,W]. Uses cache so filters survive across steps and can be trained.
+	"""
+	Kids-friendly Conv2D. Expects [N, C, H, W]. Knobs (config):
+	- finders (int): out_channels; default 16 (or 32 if step==2)
+	- window (int): kernel_size; allowed 3 or 5; default 3
+	- step (int): stride; allowed 1 or 2; default 1
+	- keep_size (bool): if True and step==1 -> padding="same" (k//2); else padding=0
+	- activation (str): "relu" (default here), "gelu", "tanh", "sigmoid", "none"
+	Other fields are inferred (in_channels from input; bias=True by default).
+	"""
 	device = _device_from_ctx(ctx)
 	x = _merge_inputs(pack_in, device)
 	if x.dim() != 4:
-		raise ValueError(f"Conv2d expects a 4D tensor [N,C,H,W], got shape {tuple(x.shape)}")
+		raise ValueError(f"Conv2d expects [N,C,H,W], got {tuple(x.shape)}")
 
 	cfg = props.get("config", {}) or {}
-	in_ch = x.shape[1]
-	out_ch = int(props.get("neuron_count", cfg.get("out_channels", in_ch)))
-	k = int(cfg.get("kernel_size", 3))
-	s = int(cfg.get("stride", 1))
-	p = int(cfg.get("padding", 1))
-	use_bias = bool(cfg.get("bias", True))
+	in_ch = int(x.shape[1])
 
-	key = _stable_cache_key("conv2d", {"in": in_ch, "out": out_ch, "k": k, "s": s, "p": p, "b": use_bias})
-	layer = _get_or_make_module(ctx, key, lambda: nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=use_bias).to(device))
+	step = int(cfg.get("step", 1))
+	k = int(cfg.get("window", 3))
+	keep_size = bool(cfg.get("keep_size", step == 1))
+	p = (k // 2) if (keep_size and step == 1) else 0
+
+	default_finders = 32 if step == 2 else 16
+	out_ch = int(cfg.get("finders", props.get("neuron_count", default_finders)))
+	use_bias = True
+
+	key = _stable_cache_key("conv2d", {"in": in_ch, "out": out_ch, "k": k, "s": step, "p": p, "b": use_bias})
+	layer = _get_or_make_module(ctx, key, lambda: nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=step, padding=p, bias=use_bias).to(device))
 	layer.train(bool(cfg.get("training", False)))
 
 	y = layer(x)
-	y = _apply_activation(y, props)
+	y = _apply_activation(y, props, default_name="relu")
 	return _make_pack(y, "conv2d", layer)
 
 
 def _maxpool2d(pack_in: List[Any], props: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-	# Max pooling: shrinks images by keeping the biggest value in each small window.
-	# Has no weights; just changes size to help later layers see the big picture.
+	"""
+	Kids-friendly MaxPool2D. Expects [N, C, H, W]. Knobs (config):
+	- shrink_by (int): sets kernel_size=stride={2 or 3}; default 2
+	Padding, dilation, indices are hidden and kept at simple defaults.
+	"""
 	device = _device_from_ctx(ctx)
 	x = _merge_inputs(pack_in, device)
 	if x.dim() != 4:
 		raise ValueError(f"MaxPool2d expects [N,C,H,W], got {tuple(x.shape)}")
 
 	cfg = props.get("config", {}) or {}
-	k = int(cfg.get("kernel_size", 2))
-	s = int(cfg.get("stride", k))
-	p = int(cfg.get("padding", 0))
-
-	pool = nn.MaxPool2d(kernel_size=k, stride=s, padding=p)
+	k = int(cfg.get("shrink_by", 2))
+	if k not in (2, 3):
+		raise ValueError("MaxPool2D 'shrink_by' must be 2 or 3.")
+	pool = nn.MaxPool2d(kernel_size=k, stride=k, padding=0)
 	y = pool(x)
 	return _make_pack(y, "maxpool2d", None)
 
 
 def _flatten(pack_in: List[Any], props: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-	# Flatten: turns images or feature maps into a simple list so Dense can read them.
-	# Keeps the batch dimension so training works on many items at once.
+	"""
+	Flattens any input to [N, -1] so Dense can follow CNN blocks. If given [F],
+	it becomes [1, F]. Batch dimension is preserved as the first dimension.
+	"""
 	device = _device_from_ctx(ctx)
 	x = _merge_inputs(pack_in, device)
 	if x.dim() == 1:
@@ -267,14 +319,16 @@ def _flatten(pack_in: List[Any], props: Dict[str, Any], ctx: Context) -> Dict[st
 
 
 def _dropout(pack_in: List[Any], props: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-	# Dropout: randomly hides some numbers while training to reduce overfitting.
-	# Does nothing when not training; great to teach randomness and robustness.
+	"""
+	Dropout for regularization. Knobs (config):
+	- p (float): probability to drop units during training; default 0.5
+	- training (bool): when True, dropout is active; otherwise it is bypassed
+	"""
 	device = _device_from_ctx(ctx)
 	x = _merge_inputs(pack_in, device)
 	cfg = props.get("config", {}) or {}
 	p = float(cfg.get("p", 0.5))
 	training = bool(cfg.get("training", False))
-
 	drop = nn.Dropout(p=p)
 	drop.train(training)
 	y = drop(x)
@@ -285,6 +339,7 @@ _LAYER_TABLE: Dict[str, Callable[[List[Any], Dict[str, Any], Context], Dict[str,
 	"dense": _dense,
 	"linear": _dense,
 	"conv2d": _conv2d,
+	"convolution2d": _conv2d,
 	"maxpool2d": _maxpool2d,
 	"flatten": _flatten,
 	"dropout": _dropout,
@@ -293,8 +348,11 @@ _LAYER_TABLE: Dict[str, Callable[[List[Any], Dict[str, Any], Context], Dict[str,
 
 @node("NeuronLayer")
 def neuron_layer(inputs: Dict[str, Any], props: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-	# Chooses which layer to run based on props.config.type and returns a datapack.
-	# Because all ports carry lists, every handler receives a list and merges them safely.
+	"""
+	Chooses a concrete layer implementation using props.config.type (case-insensitive).
+	Supported types for kids-friendly CNNs include: "conv2d", "maxpool2d", plus "dense",
+	"flatten", and "dropout". Expects every incoming port to be a list (often length-1).
+	"""
 	cfg = props.get("config", {}) or {}
 	layer_type = str(cfg.get("type", "dense")).lower()
 	handler = _LAYER_TABLE.get(layer_type)
@@ -304,27 +362,65 @@ def neuron_layer(inputs: Dict[str, Any], props: Dict[str, Any], ctx: Context) ->
 	return {"layer_out": pack_out}
 
 
-@node("TrainingNode")
+def _get_targets_from_config(props: Dict[str, Any], device: torch.device) -> torch.Tensor:
+	cfg = props.get("config", {}) or {}
+	if "target" in cfg:
+		raw = cfg["target"]
+	elif "targets" in cfg:
+		raw = cfg["targets"]
+	elif "labels" in cfg:
+		raw = cfg["labels"]
+	else:
+		raise ValueError("TrainingNode requires targets in props.config under 'target', 'targets', or 'labels'.")
+	return _to_tensor(raw, device)
+
+
+def _align_targets(y_true: torch.Tensor, y_pred: torch.Tensor, loss_name: str) -> torch.Tensor:
+	"""
+	Normalizes target shape to match prediction shape to avoid broadcasting warnings.
+	Rules:
+	- MSE:
+	  * If target is scalar or has 1 element -> expand to y_pred.shape.
+	  * If target.shape == y_pred.shape -> OK.
+	  * If target is [F] and y_pred is [B,F] -> unsqueeze to [1,F].
+	  * Else -> error with a clear message.
+	- CrossEntropy: handled elsewhere (indices [N] or one-hot [N,C]).
+	"""
+	if loss_name not in ("ce", "crossentropy", "cross_entropy"):
+		# MSE / regression path
+		if y_true.dim() == 0 or y_true.numel() == 1:
+			return y_true.expand_as(y_pred)
+		if y_true.shape == y_pred.shape:
+			return y_true
+		# Common kid case: target is [F], pred is [B,F] -> make [1,F]
+		if y_true.dim() == 1 and y_pred.dim() == 2 and y_true.shape[0] == y_pred.shape[1]:
+			return y_true.unsqueeze(0)
+		raise ValueError(
+			f"MSE target shape {tuple(y_true.shape)} is incompatible with prediction shape {tuple(y_pred.shape)}. "
+			"Provide a scalar (will broadcast), a [F] vector (for [1,F] preds), or an exact match."
+		)
+	return y_true
+
+@node("TrainInput")
 def training_node(inputs: Dict[str, Any], props: Dict[str, Any], ctx: Context) -> Dict[str, Any]:
-	# Performs one training step:
-	# 1) reads predictions and targets,
-	# 2) computes a loss,
-	# 3) backpropagates,
-	# 4) updates all cached layers with an optimizer,
-	# 5) returns the loss as a datapack so kids can “see learning”.
 	device = _device_from_ctx(ctx)
 	cfg = props.get("config", {}) or {}
 
 	y_pred = _merge_inputs(inputs.get("pred_in", []), device)
-	y_true = _merge_inputs(inputs.get("target_in", []), device)
+	y_true = _get_targets_from_config(props, device)
 
 	loss_name = str(cfg.get("loss", "mse")).lower()
+
 	if loss_name in ("ce", "crossentropy", "cross_entropy"):
+		if y_pred.dim() != 2:
+			raise ValueError(f"CrossEntropy expects logits of shape [N,C], got {tuple(y_pred.shape)}")
 		if y_true.dim() == 2 and y_true.shape == y_pred.shape:
 			y_true = y_true.argmax(dim=1)
 		y_true = y_true.long()
 		criterion = nn.CrossEntropyLoss()
 	else:
+		# Align shapes explicitly to avoid broadcasting warnings
+		y_true = _align_targets(y_true, y_pred, loss_name)
 		criterion = nn.MSELoss()
 
 	_set_all_modules_training(ctx, True)
@@ -342,4 +438,10 @@ def training_node(inputs: Dict[str, Any], props: Dict[str, Any], ctx: Context) -
 			nn.utils.clip_grad_norm_(_gather_params(ctx), float(max_grad_norm))
 		opt.step()
 
-	return {"layer_out": _make_pack(loss.detach(), "train_step", None)}
+	pack = _make_pack(loss.detach(), "train_step", None)
+	print(pack)
+	return {"layer_out": pack}
+
+def train(pack: dict, epochs: int = 1, context: Context = None):
+	for i in range(epochs):
+		execute_graph(pack, context)

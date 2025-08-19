@@ -6,6 +6,7 @@ import json as pyjson
 import graph_core
 import node_types
 
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
 app = Sanic("neuralese_api")
 
@@ -15,7 +16,9 @@ import gzip
 @app.post("/run")
 async def run_graph(request: Request):
     graph = pyjson.loads(gzip.decompress(request.body))
-    print(graph_core.execute_graph(graph).last_inbox)
+    node_types.train(graph, 100)
+    #inbox = graph_core.execute_graph(graph)
+    #print(inbox.inbox_by_page)
     return json({})
 
 

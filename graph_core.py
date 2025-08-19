@@ -87,9 +87,10 @@ class ExecutionResult:
 	inbox_by_page: Dict[str, Dict[str, Dict[str, Any]]]
 
 
+sh_context = Context()
 def execute_graph(pack: Dict[str, Any],
                              context: Context | None = None) -> ExecutionResult:
-	context = context or Context()
+	context = context or sh_context
 	pages: Dict[str, Any] = _ensure_dict(pack.get("pages"))
 	expect: Dict[str, Dict[str, int]] = _ensure_dict(pack.get("expect"))
 
