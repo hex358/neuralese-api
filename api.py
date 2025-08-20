@@ -16,7 +16,12 @@ import gzip
 @app.post("/run")
 async def run_graph(request: Request):
     graph = pyjson.loads(gzip.decompress(request.body))
-    node_types.train(graph, 100)
+    node_types.load_model(graph_core.sh_context, "digit")
+    if graph["train"]:
+        node_types.train(graph, graph_core.sh_context, 30, "datasets/mnist_ds_noise.ds")
+    else:
+        inbox = graph_core.execute_graph(graph)
+        print(inbox.last_inbox)
     #inbox = graph_core.execute_graph(graph)
     #print(inbox.inbox_by_page)
     return json({})
