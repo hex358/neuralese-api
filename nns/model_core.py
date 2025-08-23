@@ -14,7 +14,7 @@ from .optim import (
 	_modules, _optims, all_params,
 	set_train_mode, set_eval_mode, get_or_make_optim
 )
-import db.lset as lset
+import lset as lset
 
 # global state used by training node
 train_target_tensor = None
